@@ -1,0 +1,255 @@
+archetype fa2_fungible_event(owner : address) with metadata ""
+
+/* OWNERSHIP TRANSFER ------------------------------------------------------- */
+
+variable owner_candidate : option<address> = none
+
+entry declare_ownership(candidate : address) {
+  called by owner
+  effect {
+    owner_candidate := some(candidate);
+  }
+}
+
+entry claim_ownership() {
+  require {
+    ownership_r1: (owner_candidate ? the = caller : false) otherwise "INVALID_CALLER"
+  }
+  effect {
+    owner := caller;
+    owner_candidate := none
+  }
+}
+
+/*  PAUSABLE ----------------------------------------------------------------- */
+
+variable paused : bool = false
+
+function is_not_paused() : bool {
+  do_fail_if(paused, "CONTRACT_PAUSED");
+  return true
+}
+
+entry pause() {
+  called by owner
+  require {
+    pausable_r1: is_not_paused()
+  }
+  effect {
+    paused := true
+  }
+}
+
+entry unpause() {
+  called by owner
+  require {
+    pausable_r2: paused otherwise "CONTRACT_NOT_PAUSED"
+  }
+  effect {
+    paused := false
+  }
+}
+
+/* METADATA ---------------------------------------------------------------- */
+
+entry set_metadata(k: string, d : option<bytes>) {
+  called by owner
+  require { md_r1 : is_not_paused() }
+  effect {
+    metadata.update(k, d)
+  }
+}
+
+/* TOKEN METADATA ------------------------------------------------------------ */
+
+constant TOKEN_ID                 : nat    = 0
+constant METADATA_COIN            : bytes  = 0x697066733a2f2f516d617635756142437a4d77377871446f55364d444534743473695855484e4737664a68474c746f79774b35694a // ipfs://Qmav5uaBCzMw7xqDoU6MDE4t4siXUHNG7fJhGLtoywK5iJ
+
+asset token_metadata to big_map {
+  ftoken_metadata : nat;
+  token_id        : nat;
+  token_info      : map<string, bytes>;
+} initialized by {
+  {TOKEN_ID; TOKEN_ID; [("", METADATA_COIN)]}
+}
+
+entry set_token_metadata (tid : nat, tdata: map<string, bytes>) {
+  called by owner
+  require { tmd_r1: is_not_paused() }
+  effect {
+    token_metadata.add_update(tid, { token_id = tid; token_info = tdata });
+  }
+}
+
+/* ERRORS ----------------------------------------------------------------- */
+
+constant CALLER_NOT_OWNER         : string = "CALLER_NOT_OWNER"
+constant FA2_INSUFFICIENT_BALANCE : string = "FA2_INSUFFICIENT_BALANCE"
+constant FA2_INVALID_AMOUNT       : string = "FA2_INVALID_AMOUNT"
+constant FA2_NOT_OPERATOR         : string = "FA2_NOT_OPERATOR"
+constant FA2_TOKEN_UNDEFINED      : string = "FA2_TOKEN_UNDEFINED"
+
+/* PARAMETERS ------------------------------------------------------------- */
+
+record transfer_destination {
+  to_dest           : address;
+  token_id_dest     : nat;
+  token_amount_dest : nat
+} as ((%to_, (token_id, amount)))
+
+record transfer_param {
+  tp_from : address;
+  tp_txs  : list<transfer_destination>;
+} as ((%from_, %txs))
+
+/* STORAGE ---------------------------------------------------------------- */
+
+constant INITIAL_TOTAL_SUPPLY     : nat    = 123_000_000_000_000
+
+asset ledger to big_map {
+  lowner     : address;
+  lamount    : nat = 0;
+} initialized by {
+  {owner; INITIAL_TOTAL_SUPPLY}
+}
+
+asset operator identified by oaddr otoken oowner to big_map {
+  oaddr       : address;
+  otoken      : nat;
+  oowner      : address;
+}
+
+/* EVENTS ------------------------------------------------------------------ */
+
+event hasBeenSent {
+  sender : address;
+  recipient : address;
+  // target : string;
+  amount : nat;
+}
+
+/* FUNCTIONS --------------------------------------------------------------- */
+
+function get_from(txs : list<transfer_param>) : option<address> {
+  match txs with
+  | hd::tl -> begin
+    const %from = hd.tp_from;
+    for tx in tl do
+      do_require(%from = tx.tp_from, FA2_NOT_OPERATOR)
+    done;
+    return some(%from)
+  end
+  | [] -> return none
+  end
+}
+
+function check_operator(txs : list<transfer_param>) : bool {
+  var res = true;
+  for tx in txs do
+    const %from = tx.tp_from;
+    const tds = tx.tp_txs;
+    for td in tds do begin
+      res &=
+        if caller <> %from then
+          operator.contains((caller, td.token_id_dest, %from))
+        else
+          true;
+    end
+    done
+  done;
+  return res
+}
+
+/* ENTRYPOINTS ------------------------------------------------------------- */
+
+record operator_param {
+  opp_owner    : address;
+  opp_operator : address;
+  opp_token_id : nat
+} as ((owner, (operator, token_id)))
+
+entry update_operators (upl : list<or<operator_param, operator_param>>) {
+  require { fa2_r1 : is_not_paused() }
+  effect {
+    for up in upl do
+      match up with
+      | left(param) -> (* add *)
+        do_require(param.opp_owner = caller , CALLER_NOT_OWNER);
+        operator.put({param.opp_operator; param.opp_token_id; param.opp_owner})
+      | right(param) -> (* remove *)
+        do_require(param.opp_owner = caller , CALLER_NOT_OWNER);
+        operator.remove((param.opp_operator, param.opp_token_id, param.opp_owner))
+      end;
+    done;
+  }
+}
+
+entry %transfer (txs : list<transfer_param>) {
+  require { fa2_r4 : is_not_paused() }
+  effect {
+    do_require(check_operator(txs), FA2_NOT_OPERATOR);
+    for tx in txs do
+      const %from = tx.tp_from;
+      const tds   = tx.tp_txs;
+      for td in tds do begin
+        do_require(td.token_id_dest = TOKEN_ID, FA2_TOKEN_UNDEFINED);
+        const l_amount = ledger[%from]?.lamount ? the : 0;
+        const new_amount ?=
+            int_to_nat(l_amount - td.token_amount_dest) : FA2_INSUFFICIENT_BALANCE;
+        if new_amount = 0 then
+          ledger.remove(%from)
+        else begin
+          ledger.update(%from, { lamount := new_amount });
+        end;
+        ledger.add_update(td.to_dest, { lamount += td.token_amount_dest });
+        emit<hasBeenSent>({sender = %from; recipient = td.to_dest; amount = l_amount})
+      end done
+    done
+  }
+}
+
+entry mint (tow : address, nbt : nat) {
+  called by owner
+  require { fa2_r5: is_not_paused() }
+  effect {
+    ledger.add_update(tow, { lamount += nbt });
+  }
+}
+
+entry burn(nbt : nat) {
+  constant {
+    l_amount ?is ledger[caller]?.lamount otherwise FA2_INSUFFICIENT_BALANCE
+  }
+  require {
+    fa2_r6: is_not_paused();
+    fa2_r7: l_amount >= nbt otherwise FA2_INSUFFICIENT_BALANCE
+  }
+  effect {
+    if (l_amount > nbt) then
+      ledger.update(caller, { lamount -= nbt })
+    else ledger.remove(caller)
+  }
+}
+
+/* GETTERS ----------------------------------------------------------------- */
+
+record balance_of_request {
+  bo_owner : address;
+  btoken_id : nat;
+} as ((owner, token_id))
+
+record balance_of_response {
+  request : balance_of_request;
+  balance_ : nat;
+} as ((request, balance))
+
+getter balance_of (requests : list<balance_of_request>) : list<balance_of_response> {
+  return map(requests, br ->
+    let b =
+      if br.btoken_id <> TOKEN_ID then 0
+      else (ledger[br.bo_owner] ? the.lamount : 0) in
+    {
+      request = br;
+      balance_ = b
+    })
+}
